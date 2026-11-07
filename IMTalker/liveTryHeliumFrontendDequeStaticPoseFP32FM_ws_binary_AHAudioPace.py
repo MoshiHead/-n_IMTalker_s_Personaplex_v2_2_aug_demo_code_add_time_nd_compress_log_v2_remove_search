@@ -61,6 +61,84 @@ else:
 from renderer.models import IMTRenderer
 
 # ---------------------------------------------------------------------------
+# Non-blocking hot-path logging
+# ---------------------------------------------------------------------------
+# The GPU producer thread runs Moshi + the avatar renderer against a real-time
+# wall-clock schedule. A blocking print()/flush to stdout can stall that thread
+# for hundreds of ms when stdout is redirected to a slow target (e.g. RunPod's
+# /workspace network volume), which starves the video sender while audio keeps
+# playing -- the classic "avatar freezes but the voice continues" symptom.
+# Hot-path log lines are therefore queued to a daemon writer thread and never
+# block the producer. Startup / one-time / health-marker prints stay direct so
+# the notebook's startup health check is unaffected.
+
+
+class AsyncLogWriter:
+    """Drop-oldest, non-blocking stdout writer for hot-path log lines."""
+
+    def __init__(self, maxsize: int = 4096) -> None:
+        self._q: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=maxsize)
+        self._dropped = 0
+        self._thread = threading.Thread(
+            target=self._run, name="async-log-writer", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        out = sys.stdout
+        while True:
+            line = self._q.get()
+            if line is None:
+                return
+            try:
+                out.write(line + "\n")
+            except Exception:
+                pass
+            # Flush only once the queue drains, so a slow sink never forces the
+            # writer to block on every single line.
+            if self._q.empty():
+                try:
+                    out.flush()
+                except Exception:
+                    pass
+
+    def log(self, line: str) -> None:
+        try:
+            self._q.put_nowait(line)
+        except queue.Full:
+            self._dropped += 1
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped
+
+
+hot_log = AsyncLogWriter()
+
+
+async def _shed_oldest_video_frames(frame_q: "asyncio.Queue", keep: int, tag: str) -> None:
+    """Drop the oldest queued video frames down to ``keep`` (newest preserved).
+
+    Runs on the event loop via ``run_coroutine_threadsafe``. The browser renders
+    the newest frame whose number is <= the audio-driven target and tolerates
+    missing frame numbers, so shedding the oldest frames makes video skip ahead
+    instead of freezing the whole conversation behind a video backlog.
+    """
+    dropped = 0
+    try:
+        while frame_q.qsize() > keep:
+            frame_q.get_nowait()
+            dropped += 1
+    except asyncio.QueueEmpty:
+        pass
+    if dropped:
+        hot_log.log(
+            f"[GPU]{tag} video backlog: shed {dropped} oldest frame(s) "
+            f"(frame_q now {frame_q.qsize()}); conversation continues"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -1626,7 +1704,11 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             if not (isinstance(lm_out, tuple) and len(lm_out) == 3):
                 raise RuntimeError(f"Moshi graph layer[-2] contract failure: got {type(lm_out)} len={len(lm_out) if isinstance(lm_out, tuple) else 'n/a'}")
             tokens, _transformer_out, layer_hidden = lm_out
-            helium_hidden = layer_hidden[:1, -1:].detach().float().cpu()
+            # Keep the hidden state on the GPU. The producer concatenates these
+            # per-step tensors and _sample_motion_from_helium() moves the result
+            # to the device anyway, so a per-step .cpu() here just adds a
+            # GPU->CPU sync (12 per 0.96s chunk) that serializes CPU and GPU.
+            helium_hidden = layer_hidden[:1, -1:].detach().float()
 
         token = -1
         token_piece = ""
@@ -1734,13 +1816,12 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         reply_i16 = (reply_i16 * 32767.0).astype(np.int16)
         audio_b64 = base64.b64encode(reply_i16.tobytes()).decode("ascii")
 
-        print(
+        hot_log.log(
             "[liveTryStudio] moshi "
             f"step={self.step} token={token} piece={token_piece!r} "
             f"in_rms={input_rms:.5f} reply_rms={reply_rms:.5f} peak={reply_peak:.3f} "
             f"hidden={helium_hidden is not None} "
-            f"encode={encode_ms:.1f}ms lm={lm_ms:.1f}ms decode={decode_ms:.1f}ms total={total_ms:.1f}ms",
-            flush=True,
+            f"encode={encode_ms:.1f}ms lm={lm_ms:.1f}ms decode={decode_ms:.1f}ms total={total_ms:.1f}ms"
         )
 
         return {
@@ -2533,6 +2614,20 @@ class LiveHeliumFMEngine:
         return motion, timings
 
     def _record_session_chunk(self, pcm_chunk: np.ndarray, motion: torch.Tensor, info: dict) -> None:
+        # chunk_rows is tiny and drives avatar_chunk_id (= len(_session_chunk_rows)),
+        # so it is always recorded. The tensor lists below grow ~1.6MB per 0.96s
+        # chunk (~100MB/min) and are only consumed by dump_last_session, so they
+        # are recorded only when --dump_motion is on and kept to a rolling window.
+        self._session_chunk_rows.append({
+            "chunk": len(self._session_chunk_rows) + 1,
+            "abs_start": int(info.get("abs_start", 0)),
+            "frames": int(info.get("frames", int(motion.shape[0]))),
+            "samples": int(len(pcm_chunk)),
+            "helium_ms": float(info.get("helium_ms", 0.0)),
+            "fm_ms": float(info.get("fm_ms", 0.0)),
+        })
+        if not self.dump_motion:
+            return
         self._session_audio_parts.append(np.asarray(pcm_chunk, dtype=np.float32).copy())
         self._session_motion_parts.append(motion.detach().float().cpu().clone())
         helium_feat = info.get("helium_feat")
@@ -2547,14 +2642,29 @@ class LiveHeliumFMEngine:
         projected_audio = info.get("projected_audio")
         if isinstance(projected_audio, torch.Tensor):
             self._session_projected_audio_parts.append(projected_audio.float().cpu().clone())
-        self._session_chunk_rows.append({
-            "chunk": len(self._session_chunk_rows) + 1,
-            "abs_start": int(info.get("abs_start", 0)),
-            "frames": int(info.get("frames", int(motion.shape[0]))),
-            "samples": int(len(pcm_chunk)),
-            "helium_ms": float(info.get("helium_ms", 0.0)),
-            "fm_ms": float(info.get("fm_ms", 0.0)),
-        })
+        self._trim_session_parts()
+
+    def _trim_session_parts(self) -> None:
+        """Keep session-recording RAM bounded on long sessions (rolling window)."""
+        max_chunks = max(1, int(getattr(self.args, "dump_max_chunks", 900)))
+
+        def _trim(lst: list) -> None:
+            if len(lst) > max_chunks:
+                del lst[: len(lst) - max_chunks]
+
+        _trim(self._session_motion_parts)
+        _trim(self._session_helium_parts)
+        _trim(self._session_adapter_50_parts)
+        _trim(self._session_adapter_25_parts)
+        _trim(self._session_projected_audio_parts)
+        _trim(self._session_audio_parts)
+        # live tokens / reply events accumulate per Moshi step (~12-16x per chunk)
+        # and are tiny, but keep them bounded too.
+        max_steps = max_chunks * 48
+        if len(self._session_live_token_parts) > max_steps:
+            del self._session_live_token_parts[: len(self._session_live_token_parts) - max_steps]
+        if len(self._session_reply_events) > max_steps:
+            del self._session_reply_events[: len(self._session_reply_events) - max_steps]
 
     @torch.no_grad()
     def _extract_wav2vec_raw_50hz(self, audio_24k: np.ndarray) -> torch.Tensor:
@@ -2702,6 +2812,9 @@ class LiveHeliumFMEngine:
             "reply_text_chars": int(sum(len(str(row.get("piece", ""))) for row in self._session_reply_events)),
             "reply_events": int(len(self._session_reply_events)),
             "chunks": self._session_chunk_rows,
+            # Tensor lists are a rolling window of the most recent dump_max_chunks
+            # chunks (RAM-bounded); chunk_rows above is the full session index.
+            "rolling_window_chunks": int(getattr(self.args, "dump_max_chunks", 900)),
             "ref_path": str(self.args.ref_path),
             "generator_path": str(self.args.generator_path),
             "renderer_path": str(self.args.renderer_path),
@@ -3277,6 +3390,26 @@ class LiveHeliumFMOptions(BaseOptions):
         parser.add_argument("--prebuffer_chunks", type=int, default=3, help="Avatar chunks queued before sender starts pacing")
         parser.add_argument("--frame_q_backpressure", type=int, default=160)
         parser.add_argument(
+            "--jitter_buffer_sec",
+            type=float,
+            default=1.0,
+            help=(
+                "Extra end-to-end A/V buffer (seconds) banked between production and the "
+                "paced senders. Absorbs transient GPU/render/network stalls so video stays "
+                "smooth; it is a constant playback offset and does NOT add conversational "
+                "latency (the model still hears and replies in real time)."
+            ),
+        )
+        parser.add_argument(
+            "--dump_max_chunks",
+            type=int,
+            default=900,
+            help=(
+                "Rolling cap on --dump_motion session recording (avatar chunks). Keeps RAM "
+                "bounded on long sessions; dump_last_session writes the most recent window."
+            ),
+        )
+        parser.add_argument(
             "--file_chunk_lookahead",
             type=int,
             default=0,
@@ -3408,12 +3541,20 @@ def build_app(args: argparse.Namespace) -> FastAPI:
 
     split_sessions: dict[str, dict] = {}
 
+    # Extra end-to-end A/V buffer banked between production and the paced
+    # senders. Both the audio and video senders schedule packets at
+    # media_epoch + frame#/fps, so anchoring media_epoch this far in the future
+    # keeps that many seconds of frames/audio queued and absorbs transient
+    # production stalls. It is a constant playback offset, not added latency.
+    JITTER_BUFFER_SEC = max(0.0, float(getattr(args, "jitter_buffer_sec", 1.0)))
+    JITTER_OFFSET_SEC = max(0.08, JITTER_BUFFER_SEC)
+
     async def _get_split_media_epoch(session: dict) -> float:
         while not session["prebuffer_ready"].is_set() and not session.get("closed", False):
             await asyncio.sleep(0.01)
         async with session["media_epoch_lock"]:
             if session.get("media_epoch") is None:
-                session["media_epoch"] = time.perf_counter() + 0.08
+                session["media_epoch"] = time.perf_counter() + JITTER_OFFSET_SEC
             return float(session["media_epoch"])
 
     if bool(getattr(args, "enable_moshi_reply", False)):
@@ -3640,6 +3781,10 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 was_silent = True
                 assistant_gate_hold = 0
                 last_motion_frame: torch.Tensor | None = None
+                # Last transcript actually sent in a frame header. The transcript
+                # only grows when the model emits new text tokens, so we send it
+                # only when it changed (browser keeps the last non-empty value).
+                last_sent_text = ""
 
                 def _enqueue_frame(pkt: dict) -> None:
                     """Block until frame_q accepts pkt (real backpressure). Must run from GPU thread."""
@@ -3712,9 +3857,23 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     if stopped:
                         break
 
-                    # --- Phase 2: yield if outbound queue is deep (sender is the bottleneck) ---
-                    while frame_q.qsize() >= FRAME_Q_BACKPRESS:
-                        time.sleep(0.004)
+                    # --- Phase 2: shed oldest video frames if the sender falls behind ---
+                    # Never block the producer on a video backlog: that would stall
+                    # Moshi and freeze the whole conversation behind a video socket
+                    # that is momentarily slow. Shed the oldest queued frames (the
+                    # browser skips missing frame numbers and jumps to the newest)
+                    # down to the jitter depth, then keep producing in real time.
+                    if frame_q.qsize() >= FRAME_Q_BACKPRESS:
+                        _shed_keep = max(
+                            int(args.fm_chunk_frames),
+                            int(round(float(args.fps) * JITTER_OFFSET_SEC)),
+                        )
+                        asyncio.run_coroutine_threadsafe(
+                            _shed_oldest_video_frames(
+                                frame_q, _shed_keep, f"[chunk#{reply_avatar_chunk_idx}]"
+                            ),
+                            event_loop,
+                        )
 
                     if not session_started.is_set():
                         time.sleep(0.003)
@@ -3728,17 +3887,18 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     t_recv = time.perf_counter()
                     for ev in reply_engine.process_ready_steps_limited(max_moshi_steps_per_loop):
                         pending_reply_steps.append(ev)
-                        fm_engine._session_reply_events.append({
-                            "step": int(ev.get("step", -1)),
-                            "token": int(ev.get("token", -1)),
-                            "piece": str(ev.get("piece", "")),
-                            "audio_text": str(ev.get("audio_text", "")),
-                            "reply_rms": float(ev.get("reply_rms", 0.0)),
-                            "reply_peak": float(ev.get("reply_peak", 0.0)),
-                            "input_rms": float(ev.get("input_rms", 0.0)),
-                            "hidden": bool(isinstance(ev.get("helium_hidden"), torch.Tensor)),
-                            "total_ms": float(ev.get("total_ms", 0.0)),
-                        })
+                        if fm_engine.dump_motion:
+                            fm_engine._session_reply_events.append({
+                                "step": int(ev.get("step", -1)),
+                                "token": int(ev.get("token", -1)),
+                                "piece": str(ev.get("piece", "")),
+                                "audio_text": str(ev.get("audio_text", "")),
+                                "reply_rms": float(ev.get("reply_rms", 0.0)),
+                                "reply_peak": float(ev.get("reply_peak", 0.0)),
+                                "input_rms": float(ev.get("input_rms", 0.0)),
+                                "hidden": bool(isinstance(ev.get("helium_hidden"), torch.Tensor)),
+                                "total_ms": float(ev.get("total_ms", 0.0)),
+                            })
                         reply_pcm = (
                             np.frombuffer(base64.b64decode(ev["reply_i16_b64"]), dtype=np.int16)
                             .astype(np.float32) / 32768.0
@@ -3831,11 +3991,10 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             previous_active = not was_silent
                             transition = assistant_active != previous_active
                             if transition:
-                                print(
+                                hot_log.log(
                                     f"[GPU] Avatar gate transition "
                                     f"{'speech' if assistant_active else 'idle'} "
-                                    f"reply_rms={reply_rms:.5f} step_rms={step_rms:.5f}",
-                                    flush=True,
+                                    f"reply_rms={reply_rms:.5f} step_rms={step_rms:.5f}"
                                 )
                                 if assistant_active:
                                     # Server's own detection of when it started
@@ -3891,7 +4050,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                                 for s in used_steps
                                 if isinstance(s.get("reply_codes"), torch.Tensor)
                             ]
-                            if used_codes:
+                            if used_codes and fm_engine.dump_motion:
                                 fm_engine._session_live_token_parts.extend(used_codes)
                             fm_engine._record_session_chunk(pcm_chunk, motion, fm_info)
                         else:
@@ -3908,7 +4067,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                                 for s in used_steps
                                 if isinstance(s.get("reply_codes"), torch.Tensor)
                             ]
-                            if used_codes:
+                            if used_codes and fm_engine.dump_motion:
                                 fm_engine._session_live_token_parts.extend(used_codes)
 
                         reply_avatar_chunk_idx += 1
@@ -3923,11 +4082,21 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         n_frames = int(motion.shape[0])
                         emitted = int(fm_info["abs_start"])
                         output_step = used_steps[-1] if used_steps else ev
-                        text_payload = (
+                        full_text = (
                             output_step.get("audio_text")
                             or output_step.get("sampled_text")
                             or ""
                         )
+                        # The transcript accumulates across the whole session, so
+                        # embedding it in every 25fps frame header makes video
+                        # bandwidth grow with conversation length. Send it only
+                        # when it changed; the browser keeps the last non-empty
+                        # value (it ignores empty/unchanged text).
+                        if full_text != last_sent_text:
+                            text_payload = full_text
+                            last_sent_text = full_text
+                        else:
+                            text_payload = ""
                         total_gen_ms = (
                             moshi_total_ms + float(fm_info["helium_ms"]) + float(fm_info["fm_ms"])
                         )
@@ -3989,7 +4158,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             )
                             _lat.accumulate(_lat_turn, "avatar_render", chunk_wall_ms / 1000.0)
 
-                        print(
+                        hot_log.log(
                             f"[GPU][chunk#{reply_avatar_chunk_idx}] "
                             f"moshi={moshi_total_ms:.0f}ms "
                             f"helium={float(fm_info['helium_ms']):.0f}ms "
@@ -3998,8 +4167,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             f"frames={n_frames} "
                             f"produce_latency={produce_latency_ms:.0f}ms "
                             f"frame_q={q_depth} "
-                            f"abs={emitted}",
-                            flush=True,
+                            f"abs={emitted}"
                         )
 
                         if reply_avatar_chunk_idx % 50 == 0:
@@ -4009,12 +4177,11 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             # here is a delay that never shrinks on its own.
                             backlog_s = reply_engine.input_backlog_sec()
                             if backlog_s >= 1.0:
-                                print(
+                                hot_log.log(
                                     f"[GPU] WARNING microphone backlog {backlog_s:.1f}s -- replies "
                                     f"are running this far behind and the producer cannot catch up "
                                     f"(it is rate-limited to real time). Reduce per-chunk cost or "
-                                    f"lower --max_input_buffer_sec.",
-                                    flush=True,
+                                    f"lower --max_input_buffer_sec."
                                 )
                             status_kwargs = {
                                 "chunk": reply_avatar_chunk_idx,
@@ -4071,7 +4238,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     if media_epoch is None and session is not None and session.get("media_epoch") is not None:
                         media_epoch = float(session["media_epoch"])
                     if media_epoch is None:
-                        media_epoch = time.perf_counter() + 0.08
+                        media_epoch = time.perf_counter() + JITTER_OFFSET_SEC
                         if session is not None:
                             session["media_epoch"] = media_epoch
                     return media_epoch

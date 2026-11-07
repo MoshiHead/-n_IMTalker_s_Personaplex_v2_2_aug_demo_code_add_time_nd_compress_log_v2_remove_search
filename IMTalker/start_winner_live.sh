@@ -165,7 +165,8 @@ exec python -u "$SERVER_FILE" \
   --prebuffer_chunks 1 \
   --render_sub_batch 8 \
   --renderer_precision fp32 \
-  --frame_q_backpressure 32 \
+  --frame_q_backpressure "${FRAME_Q_BACKPRESSURE:-160}" \
+  --jitter_buffer_sec "${JITTER_BUFFER_SEC:-1.0}" \
   --buffer_ms 160 \
   --skip_fm_audio_encoder \
   --assistant_speech_rms_threshold "${ASSISTANT_SPEECH_RMS_THRESHOLD:-0.006}" \
